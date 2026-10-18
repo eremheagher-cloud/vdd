@@ -1,3 +1,4 @@
+
 name: RDP
 
 on:
@@ -16,27 +17,38 @@ jobs:
 
           # Enable Remote Desktop
           Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' `
-                             -Name "fDenyTSConnections" -Value 0 -Force
+            -Name "fDenyTSConnections" -Value 0 -Force
+
           Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
-                             -Name "UserAuthentication" -Value 0 -Force
+            -Name "UserAuthentication" -Value 0 -Force
+
           Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
-                             -Name "SecurityLayer" -Value 0 -Force
+            -Name "SecurityLayer" -Value 0 -Force
 
-          # Remove any existing rule with the same name
-          netsh advfirewall firewall delete rule name="RDP-Tailscale"
+          # Remove an existing firewall rule if present.
+          # A missing rule is not an error.
+          Get-NetFirewallRule -DisplayName "RDP-Tailscale" `
+            -ErrorAction SilentlyContinue |
+            Remove-NetFirewallRule -ErrorAction Stop
 
-          # Allow RDP only through the Tailscale interface when possible
-          New-NetFirewallRule -DisplayName "RDP-Tailscale" `
-            -Direction Inbound -Action Allow -Protocol TCP `
-            -LocalPort 3389 -RemoteAddress 100.64.0.0/10
+          # Permit RDP only from Tailscale IPv4 addresses.
+          New-NetFirewallRule `
+            -DisplayName "RDP-Tailscale" `
+            -Direction Inbound `
+            -Action Allow `
+            -Protocol TCP `
+            -LocalPort 3389 `
+            -RemoteAddress "100.64.0.0/10" `
+            -ErrorAction Stop
 
-          # Restart Remote Desktop service
+          # Restart the Remote Desktop service
           Restart-Service -Name TermService -Force
 
       - name: Create RDP User with Secure Password
         shell: pwsh
         run: |
           $ErrorActionPreference = "Stop"
+
           Add-Type -AssemblyName System.Security
 
           $charSet = @{
@@ -47,26 +59,34 @@ jobs:
                          [char[]](91..96) + [char[]](123..126))
           }
 
+          # Generate a random password with all character types
           $rawPassword = @()
           $rawPassword += $charSet.Upper | Get-Random -Count 4
           $rawPassword += $charSet.Lower | Get-Random -Count 4
           $rawPassword += $charSet.Number | Get-Random -Count 4
           $rawPassword += $charSet.Special | Get-Random -Count 4
+
           $password = -join ($rawPassword | Sort-Object { Get-Random })
           $securePass = ConvertTo-SecureString $password -AsPlainText -Force
 
-          # Reuse the user if it already exists
+          # Create or update the RDP user
           if (Get-LocalUser -Name "RDP" -ErrorAction SilentlyContinue) {
               Set-LocalUser -Name "RDP" -Password $securePass
-          } else {
-              New-LocalUser -Name "RDP" -Password $securePass -AccountNeverExpires
+          }
+          else {
+              New-LocalUser -Name "RDP" `
+                -Password $securePass `
+                -AccountNeverExpires
           }
 
+          # Add the account to the required groups
           Add-LocalGroupMember -Group "Administrators" -Member "RDP" `
             -ErrorAction SilentlyContinue
+
           Add-LocalGroupMember -Group "Remote Desktop Users" -Member "RDP" `
             -ErrorAction SilentlyContinue
 
+          # Preserve the generated credentials in the workflow environment
           "RDP_CREDS=User: RDP | Password: $password" |
             Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
 
@@ -79,25 +99,28 @@ jobs:
         run: |
           $ErrorActionPreference = "Stop"
 
-          # Select installer according to the runner architecture
+          # Select installer according to the operating system architecture
           $architecture = [System.Runtime.InteropServices.RuntimeInformation]::OSArchitecture.ToString()
 
           if ($architecture -eq "Arm64") {
               $tsUrl = "https://pkgs.tailscale.com/stable/tailscale-setup-1.82.0-arm64.msi"
-          } elseif ($architecture -eq "X64") {
+          }
+          elseif ($architecture -eq "X64") {
               $tsUrl = "https://pkgs.tailscale.com/stable/tailscale-setup-1.82.0-amd64.msi"
-          } else {
+          }
+          else {
               throw "Unsupported Windows architecture: $architecture"
           }
 
           $installerPath = "$env:TEMP\tailscale.msi"
 
           Invoke-WebRequest -Uri $tsUrl -OutFile $installerPath
+
           $process = Start-Process msiexec.exe `
             -ArgumentList "/i", "`"$installerPath`"", "/quiet", "/norestart" `
             -Wait -PassThru
 
-          Remove-Item $installerPath -Force
+          Remove-Item $installerPath -Force -ErrorAction SilentlyContinue
 
           if ($process.ExitCode -notin @(0, 3010)) {
               throw "Tailscale installation failed with exit code $($process.ExitCode)"
@@ -109,6 +132,7 @@ jobs:
           TAILSCALE_AUTH_KEY: ${{ secrets.TAILSCALE_AUTH_KEY }}
         run: |
           $ErrorActionPreference = "Stop"
+
           $tsExe = "$env:ProgramFiles\Tailscale\tailscale.exe"
 
           if (-not (Test-Path $tsExe)) {
@@ -119,6 +143,7 @@ jobs:
               throw "Configure the TAILSCALE_AUTH_KEY repository secret."
           }
 
+          # Connect Tailscale
           & $tsExe up "--authkey=$env:TAILSCALE_AUTH_KEY" `
             "--hostname=gh-runner-$env:GITHUB_RUN_ID"
 
@@ -132,6 +157,7 @@ jobs:
 
           while (-not $tsIP -and $retries -lt 36) {
               $result = & $tsExe ip -4
+
               if ($LASTEXITCODE -eq 0 -and $result) {
                   $tsIP = ($result | Select-Object -First 1).Trim()
               }
@@ -139,6 +165,7 @@ jobs:
               if (-not $tsIP) {
                   Start-Sleep -Seconds 5
               }
+
               $retries++
           }
 
@@ -158,11 +185,12 @@ jobs:
 
           # Test connectivity on port 3389
           $testResult = Test-NetConnection `
-            -ComputerName $env:TAILSCALE_IP -Port 3389 `
+            -ComputerName $env:TAILSCALE_IP `
+            -Port 3389 `
             -WarningAction SilentlyContinue
 
           if (-not $testResult.TcpTestSucceeded) {
-              throw "TCP connection to RDP port 3389 failed."
+              throw "TCP connection to RDP port 3389 failed"
           }
 
           Write-Host "TCP connectivity successful!"
@@ -173,7 +201,9 @@ jobs:
           Write-Host "`n=== RDP ACCESS ==="
           Write-Host "Address: $env:TAILSCALE_IP"
           Write-Host "Username: RDP"
-          Write-Host "Credentials are available in the workflow environment."
+
+          # Display credentials for the current workflow session
+          Write-Host "Password: $env:RDP_CREDS"
           Write-Host "==================`n"
 
           # Keep runner active until cancelled or timeout
@@ -181,3 +211,4 @@ jobs:
               Write-Host "[$(Get-Date)] RDP Active"
               Start-Sleep -Seconds 300
           }
+          
